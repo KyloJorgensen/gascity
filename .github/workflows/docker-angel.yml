@@ -1,0 +1,163 @@
+# =============================================================================
+# Build & push the angel-gascity-* images to ghcr.io/kylojorgensen/*
+# =============================================================================
+# Builds the four upstream images (base/agent/controller/mail) plus a
+# custom "mayor" image that wraps the controller with ttyd for Hermes-style
+# remote terminal access.
+#
+# Consumed by KyloJorgensen/kylo-proxmox under kubernetes/apps/angel-gascity/.
+#
+# The upstream gastownhall workflows in this repo are kept untouched.
+# =============================================================================
+name: Build angel-gascity images
+
+on:
+  push:
+    branches:
+      - main
+      - add-angel-mayor-and-ci
+    paths:
+      - "cmd/**"
+      - "internal/**"
+      - "contrib/**"
+      - "deps.env"
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/docker-angel.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  OWNER: kylojorgensen
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read deps.env
+        id: deps
+        run: |
+          set -a; . ./deps.env; set +a
+          echo "BD_VERSION=$BD_VERSION"   >> "$GITHUB_OUTPUT"
+          echo "DOLT_VERSION=$DOLT_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.8"
+          cache: true
+
+      - name: Build gc binary
+        run: |
+          go build -trimpath -ldflags="-s -w" -o gc ./cmd/gc
+          ./gc version || ./gc --help | head -5
+
+      - name: Download bd binary
+        run: |
+          version="${{ steps.deps.outputs.BD_VERSION }}"
+          archive="beads_${version#v}_linux_amd64.tar.gz"
+          curl -fsSL -o "$archive" \
+            "https://github.com/gastownhall/beads/releases/download/${version}/${archive}"
+          tar -xzf "$archive" bd
+          chmod +x bd
+          ./bd version || true
+
+      - name: Stub br binary (best-effort)
+        # Beads-Rust (br) ships separately and may not be needed at runtime
+        # by the controller. If a real release exists we'd fetch it the same
+        # way; for now, a stub satisfies the COPY in Dockerfile.agent.
+        run: |
+          cat > br <<'BREOF'
+          #!/bin/sh
+          echo "br: stub binary in angel-gascity image" >&2
+          exit 0
+          BREOF
+          chmod +x br
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute tags
+        id: tags
+        run: |
+          SHA="${GITHUB_SHA::7}"
+          BASE_TAG="${REGISTRY}/${OWNER}"
+          echo "BASE_TAG=$BASE_TAG"                                     >> "$GITHUB_OUTPUT"
+          echo "BASE_IMG=$BASE_TAG/angel-gascity-base"                  >> "$GITHUB_OUTPUT"
+          echo "AGENT_IMG=$BASE_TAG/angel-gascity-agent"                >> "$GITHUB_OUTPUT"
+          echo "CONTROLLER_IMG=$BASE_TAG/angel-gascity-controller"      >> "$GITHUB_OUTPUT"
+          echo "MAIL_IMG=$BASE_TAG/angel-gascity-mail"                  >> "$GITHUB_OUTPUT"
+          echo "MAYOR_IMG=$BASE_TAG/angel-gascity-mayor"                >> "$GITHUB_OUTPUT"
+          echo "SHA=$SHA"                                               >> "$GITHUB_OUTPUT"
+
+      - name: Build & push base
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: contrib/k8s/Dockerfile.base
+          build-args: |
+            DOLT_VERSION=${{ steps.deps.outputs.DOLT_VERSION }}
+          push: true
+          tags: |
+            ${{ steps.tags.outputs.BASE_IMG }}:latest
+            ${{ steps.tags.outputs.BASE_IMG }}:${{ steps.tags.outputs.SHA }}
+
+      - name: Build & push agent
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: contrib/k8s/Dockerfile.agent
+          build-args: |
+            BASE_IMAGE=${{ steps.tags.outputs.BASE_IMG }}:${{ steps.tags.outputs.SHA }}
+          push: true
+          tags: |
+            ${{ steps.tags.outputs.AGENT_IMG }}:latest
+            ${{ steps.tags.outputs.AGENT_IMG }}:${{ steps.tags.outputs.SHA }}
+
+      - name: Build & push controller
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: contrib/k8s/Dockerfile.controller
+          build-args: |
+            BASE=${{ steps.tags.outputs.AGENT_IMG }}:${{ steps.tags.outputs.SHA }}
+          push: true
+          tags: |
+            ${{ steps.tags.outputs.CONTROLLER_IMG }}:latest
+            ${{ steps.tags.outputs.CONTROLLER_IMG }}:${{ steps.tags.outputs.SHA }}
+
+      - name: Build & push mail
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: contrib/k8s/Dockerfile.mail
+          push: true
+          tags: |
+            ${{ steps.tags.outputs.MAIL_IMG }}:latest
+            ${{ steps.tags.outputs.MAIL_IMG }}:${{ steps.tags.outputs.SHA }}
+
+      - name: Build & push mayor (controller + ttyd)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: contrib/k8s-angel/Dockerfile.mayor
+          build-args: |
+            BASE=${{ steps.tags.outputs.CONTROLLER_IMG }}:${{ steps.tags.outputs.SHA }}
+          push: true
+          tags: |
+            ${{ steps.tags.outputs.MAYOR_IMG }}:latest
+            ${{ steps.tags.outputs.MAYOR_IMG }}:${{ steps.tags.outputs.SHA }}

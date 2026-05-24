@@ -1,0 +1,37 @@
+# =============================================================================
+# Gas City Mayor — Hermes-style remote terminal in front of `gc start`
+# =============================================================================
+# Extends the standard controller image with `ttyd` so a single in-cluster
+# pod exposes the mayor's tmux session over WebSocket on :7681. Authentik
+# forward-auth in front of the Ingress gates access — ttyd itself is
+# unauthenticated.
+#
+# Used by the KyloJorgensen/kylo-proxmox angel-gascity deployment. Source
+# of the canonical /usr/local/bin/start-mayor.sh is mirrored into the
+# kylo-proxmox ConfigMap at kubernetes/apps/angel-gascity/configmap.yaml;
+# this Dockerfile bakes a copy in for the default ENTRYPOINT.
+#
+# Build (in GHA matrix):
+#   docker build -f contrib/k8s-angel/Dockerfile.mayor \
+#     --build-arg BASE=ghcr.io/kylojorgensen/angel-gascity-controller:$TAG \
+#     -t ghcr.io/kylojorgensen/angel-gascity-mayor:$TAG .
+# =============================================================================
+ARG BASE=ghcr.io/kylojorgensen/angel-gascity-controller:latest
+FROM ${BASE}
+
+USER root
+
+# ttyd serves the tmux PTY over WebSocket. ca-certificates for HTTPS calls
+# from the mayor (Anthropic API, GitHub). tmux already present in base.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ttyd \
+      ca-certificates \
+      curl \
+      && rm -rf /var/lib/apt/lists/*
+
+COPY contrib/k8s-angel/start-mayor.sh /usr/local/bin/start-mayor.sh
+RUN chmod +x /usr/local/bin/start-mayor.sh
+
+EXPOSE 7681
+
+ENTRYPOINT ["/usr/local/bin/start-mayor.sh"]
