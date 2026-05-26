@@ -6,6 +6,17 @@
 # forward-auth in front of the Ingress gates access — ttyd itself is
 # unauthenticated.
 #
+# Important runtime constraints (learned from a live mayor deploy):
+#   1. `claude --dangerously-skip-permissions` (the flag the gc supervisor
+#      passes to every agent) refuses to run as root for security reasons.
+#      We therefore drop privileges to the `gcagent` user (UID 1001, set
+#      up in the upstream Dockerfile.base) at the end of this image.
+#   2. The `bd` (beads) binary links against libicu74. Upstream
+#      Dockerfile.base doesn't install it — without libicu74, `gc init`
+#      fails silently because the beads schema bootstrap dies.
+#   3. `gc init`'s dependency check requires `lsof`. Also missing
+#      from upstream Dockerfile.base.
+#
 # Used by the KyloJorgensen/kylo-proxmox angel-gascity deployment. Source
 # of the canonical /usr/local/bin/start-mayor.sh is mirrored into the
 # kylo-proxmox ConfigMap at kubernetes/apps/angel-gascity/configmap.yaml;
@@ -21,16 +32,33 @@ FROM ${BASE}
 
 USER root
 
-# ttyd serves the tmux PTY over WebSocket. ca-certificates for HTTPS calls
-# from the mayor (Anthropic API, GitHub). tmux already present in base.
+# Runtime dependencies that upstream Dockerfile.base / controller miss:
+#   ttyd       — WebSocket-PTY server, serves the mayor tmux
+#   ca-certs   — HTTPS calls (Anthropic API, GitHub) — already in base but
+#                redundant install is cheap
+#   curl       — debugging in the live pod
+#   lsof       — `gc init`'s dependency probe demands it
+#   libicu74   — the `bd` binary's transitive C++ ICU requirement; without
+#                it, beads schema bootstrap silently fails
+#   bsdmainutils — provides `script` for PTY-wrapping the gc init wizard
+#                (its prompts ignore piped stdin)
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ttyd \
       ca-certificates \
       curl \
+      lsof \
+      libicu74 \
+      bsdmainutils \
       && rm -rf /var/lib/apt/lists/*
 
 COPY contrib/k8s-angel/start-mayor.sh /usr/local/bin/start-mayor.sh
 RUN chmod +x /usr/local/bin/start-mayor.sh
+
+# `gcagent` is created in upstream Dockerfile.base (UID 1001, group 1001,
+# home /home/gcagent, sudo NOPASSWD). The k8s Deployment overrides HOME
+# at runtime to point at the PVC-backed /city so OAuth tokens, git/dolt
+# config, and supervisor state survive pod restarts.
+USER gcagent
 
 EXPOSE 7681
 
