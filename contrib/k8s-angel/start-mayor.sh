@@ -1,21 +1,32 @@
-#!/bin/sh
+#!/bin/bash
 # =============================================================================
-# start-mayor.sh — boots the gascity controller as a tmux session and
-# exposes the PTY over WebSocket via ttyd.
+# start-mayor.sh — boots the gascity controller and exposes per-tmux-session
+# PTYs over WebSocket via ttyd, one path per session.
 # =============================================================================
 # Drop-in copy of the script also distributed via the kylo-proxmox ConfigMap
 # at kubernetes/apps/angel-gascity/configmap.yaml. The ConfigMap mount wins
 # at runtime (we mount it at /etc/angel-gascity/start-mayor.sh and override
 # command), but this baked copy makes the image runnable standalone too.
 #
-# Runtime expectations:
-#   - Pod runs as `gcagent` (UID 1001) — required for claude's
-#     --dangerously-skip-permissions flag.
-#   - HOME=/city — the PVC-backed dir. Lets OAuth credentials
-#     ($HOME/.claude/.credentials.json), git config, dolt config, and gc
-#     state all survive pod restarts.
-#   - PATH must include /city/.local/bin (where claude installs to under
-#     HOME=/city). The Deployment env sets PATH; this script trusts it.
+# Runtime expectations (from the Deployment spec):
+#   - Pod runs as `gcagent` (UID 1001) — required for `claude
+#     --dangerously-skip-permissions` to work
+#   - HOME=/home/gcagent (gcagent's real user home — the gc supervisor
+#     refuses to start if HOME is overridden). Symlinks below bridge the
+#     ephemeral /home/gcagent to the PVC-backed /city.
+#   - GC_HOME=/city — the city directory the supervisor manages
+#   - PATH includes /city/.local/bin (claude install path under HOME=/city)
+#
+# URL layout (after this script runs):
+#   /                            → 302 → /city/mayor (Traefik middleware)
+#   /city/mayor                  → port 7681 (bash shell in tmux session "mayor")
+#   /city/gastown__mayor         → port 7682 (mayor agent)
+#   /city/gastown__deacon        → port 7683 (deacon agent)
+#   /city/gastown__boot          → port 7684 (boot agent)
+#
+# All sessions live on the `city` tmux socket (-L city). Dynamically-spawned
+# agents (gastown__dog-1..3) are reachable via `tmux -L city attach -t
+# gastown__dog-1` from inside any of the above shells.
 # =============================================================================
 set -eu
 
@@ -36,9 +47,9 @@ if [ "$(stat -c %u "$CITY/.beads" 2>/dev/null || echo 1001)" != "1001" ]; then
 fi
 
 # gc supervisor refuses to start if HOME is overridden away from the
-# user's natural home ("HOME override ... differs from the user home").
-# Bridge gcagent's real home to the PVC so dotfiles persist across pod
-# restarts. Each link is only created if the dest doesn't already exist.
+# user's natural home. Bridge gcagent's real home to the PVC so dotfiles
+# persist across pod restarts. Each link is only created if the dest
+# doesn't already exist.
 mkdir -p "$GCAGENT_HOME"
 for sub in .claude .claude.json .gitconfig .dolt .gc .beads .npm .local .cache; do
   tgt="$CITY/$sub"
@@ -49,8 +60,7 @@ for sub in .claude .claude.json .gitconfig .dolt .gc .beads .npm .local .cache; 
   fi
 done
 
-# First-boot: stamp out city.toml. The kylo-proxmox ConfigMap provides
-# /etc/angel-gascity/city.toml with a __DOLT_ROOT_PASSWORD__ placeholder.
+# First-boot: stamp out city.toml.
 if [ ! -f "$CITY/city.toml" ] && [ -f /etc/angel-gascity/city.toml ]; then
   mkdir -p "$CITY"
   sed "s|__DOLT_ROOT_PASSWORD__|${ANGEL_DOLT_ROOT_PASSWORD:-}|g" \
@@ -58,21 +68,14 @@ if [ ! -f "$CITY/city.toml" ] && [ -f /etc/angel-gascity/city.toml ]; then
   echo "[start-mayor] wrote $CITY/city.toml"
 fi
 
-# Identity for git AND dolt. Both write to $HOME/{.gitconfig,.dolt/} and
-# both refuse certain operations without these set.
+# Identity for git AND dolt.
 git  config --global user.name  "Angel Mayor"                || true
 git  config --global user.email "angel-mayor@kylosites.com"  || true
 git  config --global --add safe.directory "*"                || true
 dolt config --global --add user.name  "Angel Mayor"          || true
 dolt config --global --add user.email "angel-mayor@kylosites.com" || true
 
-# Initialize the city only if NEITHER marker dir exists. Picks the
-# `gastown` pack rather than the default `minimal` pack.
-#
-# Caveat: upstream `gc init` ignores piped stdin (-> always picks default).
-# We use `script -qfc` to give it a real PTY when running non-interactively.
-# If `script` isn't installed, fall back to plain init (which may pick the
-# wrong pack — operator can re-run `gc init --pack gastown` from the tmux).
+# Init the city if needed (gastown pack, via PTY for the wizard).
 if [ ! -d "$CITY/.gc" ] && [ ! -d "$CITY/.beads" ]; then
   echo "[start-mayor] running gc init --pack gastown..."
   cd "$CITY"
@@ -83,14 +86,55 @@ if [ ! -d "$CITY/.gc" ] && [ ! -d "$CITY/.beads" ]; then
   fi
 fi
 
-# tmux session. Always a bash login shell — survives any subprocess crash.
-# The operator runs `gc start --foreground` themselves from the attached
-# terminal once they've completed the one-time `claude /login` OAuth flow.
-if ! tmux has-session -t mayor 2>/dev/null; then
-  tmux new-session -d -s mayor -x 220 -y 50 "cd $CITY && exec bash -l"
-  echo "[start-mayor] tmux 'mayor' session started (bash shell, no auto-gc)"
+# -----------------------------------------------------------------------------
+# Create the bash-shell tmux session on the `city` socket (same socket gc
+# uses for agents), so all sessions are siblings on one socket and so the
+# inner shell's `tmux ls` shows both the bash session AND every agent.
+# -----------------------------------------------------------------------------
+if ! tmux -L city has-session -t mayor 2>/dev/null; then
+  tmux -L city new-session -d -s mayor -x 220 -y 50 "cd $CITY && exec bash -l"
+  echo "[start-mayor] tmux -L city session 'mayor' started (bash login shell)"
 fi
 
-# Foreground: ttyd serves the mayor tmux session on :7681. -W gives write
-# access (operator types into the terminal).
-exec ttyd -W -p 7681 -i 0.0.0.0 tmux attach -t mayor
+# -----------------------------------------------------------------------------
+# ttyd processes — one per (well-known) tmux session, each on its own port
+# with a path prefix matching the URL. Each loop waits for the target
+# session to exist before exec'ing ttyd, then restarts ttyd if it dies.
+#
+# The bash shell session ("mayor") was just created above so it exists
+# immediately; the agent sessions are spawned by `gc start` which the
+# operator runs from any attached shell.
+# -----------------------------------------------------------------------------
+ttyd_loop() {
+  local port="$1" session="$2"
+  local basepath="/city/${session}"
+  while :; do
+    # Wait for the tmux session to exist.
+    while ! tmux -L city has-session -t "${session}" 2>/dev/null; do
+      sleep 3
+    done
+    echo "[start-mayor] ttyd: serving ${basepath} on :${port} -> tmux -L city attach -t ${session}"
+    ttyd -W -p "${port}" -i 0.0.0.0 --base-path "${basepath}" \
+      tmux -L city attach -t "${session}" || true
+    sleep 2
+  done
+}
+
+ttyd_loop 7681 mayor             &
+ttyd_loop 7682 gastown__mayor    &
+ttyd_loop 7683 gastown__deacon   &
+ttyd_loop 7684 gastown__boot     &
+
+# Graceful shutdown: forward SIGTERM to all backgrounded ttyd loops so the
+# container exits promptly instead of waiting for the K8s SIGKILL timeout.
+shutdown() {
+  echo "[start-mayor] caught signal, terminating children"
+  kill $(jobs -p) 2>/dev/null || true
+  wait
+  exit 0
+}
+trap shutdown TERM INT
+
+# Wait on any one child to exit (which shouldn't happen — the loops are
+# infinite). If something does die, we trap+propagate.
+wait -n
