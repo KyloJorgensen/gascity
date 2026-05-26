@@ -19,10 +19,10 @@
 # =============================================================================
 set -eu
 
-: "${HOME:?HOME must be set (point at /city)}"
-: "${GC_HOME:=${HOME}}"
-export GC_HOME
-CITY="${GC_HOME}"
+GCAGENT_HOME="${HOME:-/home/gcagent}"
+CITY="${GC_HOME:-/city}"
+export HOME="${GCAGENT_HOME}"
+export GC_HOME="${CITY}"
 
 # Ensure /city is fully owned by gcagent. fsGroup only sets the group,
 # not the owner. Legacy PVC artifacts from when the mayor pod ran as
@@ -34,6 +34,20 @@ if [ "$(stat -c %u "$CITY/.beads" 2>/dev/null || echo 1001)" != "1001" ]; then
   echo "[start-mayor] chowning $CITY to gcagent:gcagent (legacy root-owned tree)"
   sudo chown -R gcagent:gcagent "$CITY" 2>/dev/null || true
 fi
+
+# gc supervisor refuses to start if HOME is overridden away from the
+# user's natural home ("HOME override ... differs from the user home").
+# Bridge gcagent's real home to the PVC so dotfiles persist across pod
+# restarts. Each link is only created if the dest doesn't already exist.
+mkdir -p "$GCAGENT_HOME"
+for sub in .claude .claude.json .gitconfig .dolt .gc .beads .npm .local .cache; do
+  tgt="$CITY/$sub"
+  lnk="$GCAGENT_HOME/$sub"
+  if [ -e "$tgt" ] && [ ! -e "$lnk" ]; then
+    ln -sf "$tgt" "$lnk"
+    echo "[start-mayor] linked $lnk -> $tgt"
+  fi
+done
 
 # First-boot: stamp out city.toml. The kylo-proxmox ConfigMap provides
 # /etc/angel-gascity/city.toml with a __DOLT_ROOT_PASSWORD__ placeholder.
