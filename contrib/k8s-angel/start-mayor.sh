@@ -24,6 +24,17 @@ set -eu
 export GC_HOME
 CITY="${GC_HOME}"
 
+# Ensure /city is fully owned by gcagent. fsGroup only sets the group,
+# not the owner. Legacy PVC artifacts from when the mayor pod ran as
+# root (pre-2026-05-26) are still owned by root; `gc start` calls
+# `chmod 700 /city/.beads` which fails without ownership. Use the
+# NOPASSWD sudo entry that upstream Dockerfile.base sets up for
+# gcagent. Idempotent — does nothing on already-correct trees.
+if [ "$(stat -c %u "$CITY/.beads" 2>/dev/null || echo 1001)" != "1001" ]; then
+  echo "[start-mayor] chowning $CITY to gcagent:gcagent (legacy root-owned tree)"
+  sudo chown -R gcagent:gcagent "$CITY" 2>/dev/null || true
+fi
+
 # First-boot: stamp out city.toml. The kylo-proxmox ConfigMap provides
 # /etc/angel-gascity/city.toml with a __DOLT_ROOT_PASSWORD__ placeholder.
 if [ ! -f "$CITY/city.toml" ] && [ -f /etc/angel-gascity/city.toml ]; then
