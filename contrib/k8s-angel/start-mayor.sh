@@ -97,13 +97,30 @@ if ! tmux -L city has-session -t mayor 2>/dev/null; then
 fi
 
 # -----------------------------------------------------------------------------
+# Auto-start the gc supervisor + agents. Idempotent — gc start re-registers
+# the city and either starts a fresh supervisor or no-ops if one is
+# already running. Skipped if /city isn't initialized.
+#
+# Requires OAuth credentials at /city/.claude/.credentials.json (set up
+# via a one-time `claude /login` from the bash terminal). Without them,
+# agents will spawn-fail in a loop but the supervisor itself stays alive.
+# -----------------------------------------------------------------------------
+if [ -d "$CITY/.gc" ]; then
+  echo "[start-mayor] launching gc supervisor for $CITY"
+  (cd "$CITY" && gc start "$CITY" 2>&1 | sed 's/^/[gc-start] /') || \
+    echo "[start-mayor] gc start exited non-zero (continuing)"
+else
+  echo "[start-mayor] /city not initialized (no .gc/); skipping auto-start"
+fi
+
+# -----------------------------------------------------------------------------
 # ttyd processes — one per (well-known) tmux session, each on its own port
 # with a path prefix matching the URL. Each loop waits for the target
 # session to exist before exec'ing ttyd, then restarts ttyd if it dies.
 #
-# The bash shell session ("mayor") was just created above so it exists
-# immediately; the agent sessions are spawned by `gc start` which the
-# operator runs from any attached shell.
+# The bash shell session ("mayor") was just created above. The agent
+# sessions (gastown__mayor, gastown__deacon, gastown__boot) are spawned
+# by the gc supervisor launched above; the loops poll until they exist.
 # -----------------------------------------------------------------------------
 ttyd_loop() {
   local port="$1" session="$2"
