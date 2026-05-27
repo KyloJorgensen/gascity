@@ -87,14 +87,13 @@ if [ ! -d "$CITY/.gc" ] && [ ! -d "$CITY/.beads" ]; then
 fi
 
 # -----------------------------------------------------------------------------
-# Create the bash-shell tmux session on the `city` socket (same socket gc
-# uses for agents), so all sessions are siblings on one socket and so the
-# inner shell's `tmux ls` shows both the bash session AND every agent.
+# Note: the bash-shell tmux session (`mayor`) is no longer created up-front
+# here. The ttyd_loop below owns it via the `creator` argument so that if
+# the user exits the bash shell interactively (which kills the tmux
+# session), the loop re-creates it instead of permanently 502'ing the
+# /city/mayor URL. Agent sessions (gastown__*) are recreated by the gc
+# supervisor on their own; we just poll.
 # -----------------------------------------------------------------------------
-if ! tmux -L city has-session -t mayor 2>/dev/null; then
-  tmux -L city new-session -d -s mayor -x 220 -y 50 "cd $CITY && exec bash -l"
-  echo "[start-mayor] tmux -L city session 'mayor' started (bash login shell)"
-fi
 
 # -----------------------------------------------------------------------------
 # Auto-start the gc supervisor + agents. Idempotent — gc start re-registers
@@ -118,17 +117,28 @@ fi
 # with a path prefix matching the URL. Each loop waits for the target
 # session to exist before exec'ing ttyd, then restarts ttyd if it dies.
 #
-# The bash shell session ("mayor") was just created above. The agent
-# sessions (gastown__mayor, gastown__deacon, gastown__boot) are spawned
-# by the gc supervisor launched above; the loops poll until they exist.
+# The bash shell session ("mayor") is created+restarted by its loop's
+# `creator` argument. The agent sessions (gastown__mayor,
+# gastown__deacon, gastown__boot) are spawned by the gc supervisor
+# launched above; the loops poll until they exist.
 # -----------------------------------------------------------------------------
 ttyd_loop() {
-  local port="$1" session="$2"
+  local port="$1" session="$2" creator="${3:-}"
   local basepath="/city/${session}"
   while :; do
-    # Wait for the tmux session to exist.
+    # Wait for the tmux session to exist. If a `creator` command was
+    # supplied (used for the bash shell session — agent sessions are
+    # supervisor-managed, so they recreate themselves), invoke it whenever
+    # the session goes missing. Idempotent: tmux new-session fails fast
+    # if the session already exists, which is fine.
     while ! tmux -L city has-session -t "${session}" 2>/dev/null; do
-      sleep 3
+      if [ -n "${creator}" ]; then
+        echo "[start-mayor] (re)creating tmux -L city session '${session}'"
+        eval "${creator}" || true
+        sleep 1
+      else
+        sleep 3
+      fi
     done
     echo "[start-mayor] ttyd: serving ${basepath} on :${port} -> tmux -L city attach -t ${session}"
     ttyd -W -p "${port}" -i 0.0.0.0 --base-path "${basepath}" \
@@ -137,7 +147,11 @@ ttyd_loop() {
   done
 }
 
-ttyd_loop 7681 mayor             &
+# Only the bash shell gets a creator — agent tmux sessions are owned by
+# the gc supervisor (it spawns/restarts them as it sees fit).
+MAYOR_BASH_CREATE="tmux -L city new-session -d -s mayor -x 220 -y 50 \"cd ${CITY} && exec bash -l\""
+
+ttyd_loop 7681 mayor             "${MAYOR_BASH_CREATE}" &
 ttyd_loop 7682 gastown__mayor    &
 ttyd_loop 7683 gastown__deacon   &
 ttyd_loop 7684 gastown__boot     &
