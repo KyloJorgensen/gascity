@@ -75,21 +75,41 @@ git  config --global --add safe.directory "*"                || true
 dolt config --global --add user.name  "Angel Mayor"          || true
 dolt config --global --add user.email "angel-mayor@kylosites.com" || true
 
-# Pin the supervisor's HTTP API to a deterministic port (8372 — gc
-# docs' default). Without this, gc supervisor picks a random free port
-# and writes it into /city/supervisor.toml, which breaks the Service
-# definition that expects a known port. Idempotent: only rewrite the
-# file if the port differs from 8372.
+# Write supervisor.toml deterministically:
+#   - port:            pinned (default 8372) so the k8s Service can use a
+#                      known targetPort instead of gc's random free-port.
+#   - bind = 0.0.0.0:  so the supervisor is reachable from the pod IP and
+#                      through the k8s Service (not just from inside the
+#                      pod's loopback). Otherwise Traefik can't proxy the
+#                      browser-facing /api/* requests to it.
+#   - allow_mutations: override gc's "binding to non-localhost ->
+#                      mutations disabled" guard. The dashboard SPA needs
+#                      mutations (assigning beads, sending mail, rig
+#                      lifecycle actions) to be useful; authentik
+#                      forward-auth is our perimeter security model.
 SUPERVISOR_PORT="${GC_SUPERVISOR_PORT:-8372}"
+SUPERVISOR_BIND="${GC_SUPERVISOR_BIND:-0.0.0.0}"
+SUPERVISOR_ALLOW_MUTATIONS="${GC_SUPERVISOR_ALLOW_MUTATIONS:-true}"
+write_supervisor_toml() {
+  cat > "$CITY/supervisor.toml" <<EOF_TOML
+[supervisor]
+port = ${SUPERVISOR_PORT}
+bind = "${SUPERVISOR_BIND}"
+allow_mutations = ${SUPERVISOR_ALLOW_MUTATIONS}
+EOF_TOML
+}
+NEED_REWRITE=1
 if [ -f "$CITY/supervisor.toml" ]; then
-  CURRENT_PORT="$(awk -F'=' '/^port[[:space:]]*=/{gsub(/[[:space:]]/,"",$2); print $2}' "$CITY/supervisor.toml" | head -1)"
-  if [ "$CURRENT_PORT" != "$SUPERVISOR_PORT" ]; then
-    echo "[start-mayor] pinning supervisor port -> $SUPERVISOR_PORT (was: ${CURRENT_PORT:-unset})"
-    printf '[supervisor]\nport = %s\n' "$SUPERVISOR_PORT" > "$CITY/supervisor.toml"
+  CURRENT_PORT="$(awk -F'=' '/^port[[:space:]]*=/{gsub(/[[:space:]"]/,"",$2); print $2}' "$CITY/supervisor.toml" | head -1)"
+  CURRENT_BIND="$(awk -F'=' '/^bind[[:space:]]*=/{gsub(/[[:space:]"]/,"",$2); print $2}' "$CITY/supervisor.toml" | head -1)"
+  CURRENT_ALLOW="$(awk -F'=' '/^allow_mutations[[:space:]]*=/{gsub(/[[:space:]"]/,"",$2); print $2}' "$CITY/supervisor.toml" | head -1)"
+  if [ "$CURRENT_PORT" = "$SUPERVISOR_PORT" ] && [ "$CURRENT_BIND" = "$SUPERVISOR_BIND" ] && [ "$CURRENT_ALLOW" = "$SUPERVISOR_ALLOW_MUTATIONS" ]; then
+    NEED_REWRITE=0
   fi
-else
-  echo "[start-mayor] writing $CITY/supervisor.toml (port=$SUPERVISOR_PORT)"
-  printf '[supervisor]\nport = %s\n' "$SUPERVISOR_PORT" > "$CITY/supervisor.toml"
+fi
+if [ "$NEED_REWRITE" = "1" ]; then
+  echo "[start-mayor] writing $CITY/supervisor.toml (port=$SUPERVISOR_PORT bind=$SUPERVISOR_BIND allow_mutations=$SUPERVISOR_ALLOW_MUTATIONS)"
+  write_supervisor_toml
 fi
 
 # Init the city if needed (gastown pack, via PTY for the wizard).
