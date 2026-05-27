@@ -75,6 +75,23 @@ git  config --global --add safe.directory "*"                || true
 dolt config --global --add user.name  "Angel Mayor"          || true
 dolt config --global --add user.email "angel-mayor@kylosites.com" || true
 
+# Pin the supervisor's HTTP API to a deterministic port (8372 — gc
+# docs' default). Without this, gc supervisor picks a random free port
+# and writes it into /city/supervisor.toml, which breaks the Service
+# definition that expects a known port. Idempotent: only rewrite the
+# file if the port differs from 8372.
+SUPERVISOR_PORT="${GC_SUPERVISOR_PORT:-8372}"
+if [ -f "$CITY/supervisor.toml" ]; then
+  CURRENT_PORT="$(awk -F'=' '/^port[[:space:]]*=/{gsub(/[[:space:]]/,"",$2); print $2}' "$CITY/supervisor.toml" | head -1)"
+  if [ "$CURRENT_PORT" != "$SUPERVISOR_PORT" ]; then
+    echo "[start-mayor] pinning supervisor port -> $SUPERVISOR_PORT (was: ${CURRENT_PORT:-unset})"
+    printf '[supervisor]\nport = %s\n' "$SUPERVISOR_PORT" > "$CITY/supervisor.toml"
+  fi
+else
+  echo "[start-mayor] writing $CITY/supervisor.toml (port=$SUPERVISOR_PORT)"
+  printf '[supervisor]\nport = %s\n' "$SUPERVISOR_PORT" > "$CITY/supervisor.toml"
+fi
+
 # Init the city if needed (gastown pack, via PTY for the wizard).
 if [ ! -d "$CITY/.gc" ] && [ ! -d "$CITY/.beads" ]; then
   echo "[start-mayor] running gc init --pack gastown..."
@@ -168,6 +185,22 @@ ttyd_loop 7681 mayor             &
 ttyd_loop 7682 gastown__mayor    &
 ttyd_loop 7683 gastown__deacon   &
 ttyd_loop 7684 gastown__boot     &
+
+# -----------------------------------------------------------------------------
+# gc dashboard SPA — static TypeScript bundle compiled into the gc binary.
+# Serves at :8080 and tells the SPA to call the supervisor API via the
+# public /api/ path so the browser hits the same origin (same authentik
+# cookie). Restart-loop so a transient gc failure doesn't permanently
+# kill the dashboard.
+# -----------------------------------------------------------------------------
+DASHBOARD_API_URL="${GC_DASHBOARD_API_URL:-https://angel-gascity.kylosites.com/api}"
+(
+  while :; do
+    echo "[start-mayor] gc dashboard serve --port 8080 --api ${DASHBOARD_API_URL}"
+    gc dashboard serve --port 8080 --api "${DASHBOARD_API_URL}" 2>&1 | sed 's/^/[gc-dashboard] /' || true
+    sleep 5
+  done
+) &
 
 # Graceful shutdown: forward SIGTERM to all backgrounded ttyd loops so the
 # container exits promptly instead of waiting for the K8s SIGKILL timeout.
